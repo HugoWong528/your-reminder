@@ -46,8 +46,50 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 HKO_RSS_URL = "https://rss.weather.gov.hk/rss/CurrentWeather_uc.xml"
+HKO_RHRREAD_URL = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php"
 POLLINATIONS_API_URL = "https://gen.pollinations.ai/v1/chat/completions"
 REQUEST_TIMEOUT = 15  # seconds
+USER_AGENT = "your-reminder/1.0 (+https://github.com/HugoWong528/your-reminder)"
+
+# ---------------------------------------------------------------------------
+# Location constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_LOCATION = "元朗公園"
+
+# Maps user-facing name -> HKO station name used in the rhrread API response.
+AVAILABLE_LOCATIONS: dict[str, str] = {
+    "元朗公園": "元朗公園",
+    "元朗": "元朗公園",
+    "天水圍": "天水圍",
+    "沙田": "沙田",
+    "觀塘": "觀塘",
+    "荃灣": "荃灣城門谷",
+    "屯門": "屯門",
+    "將軍澳": "將軍澳",
+    "大埔": "大埔",
+    "粉嶺": "粉嶺",
+    "西貢": "西貢",
+    "石崗": "石崗",
+    "打鼓嶺": "打鼓嶺",
+    "馬鞍山": "馬鞍山",
+    "青衣": "青衣",
+    "長洲": "長洲",
+    "香港天文台": "香港天文台",
+    "中環": "香港天文台",
+}
+
+# School uniform items available to the user (male student).
+SCHOOL_CLOTHING_LIST = (
+    "可選校服/衣物清單（男生）：\n"
+    "- 恤衫：冬季長袖 / 夏季短袖（必穿，配長褲）\n"
+    "- 毛衣(背心)\n"
+    "- 毛衣(長袖)\n"
+    "- PE 外套(風褸)\n"
+    "- 校褸\n"
+    "- 底衣：長袖 / 短袖 / 保暖款 / 背心\n"
+    "- 底褲：長 / 短 / 保暖款"
+)
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -86,7 +128,7 @@ class WeatherFetcher:
         try:
             req = urllib.request.Request(
                 self.url,
-                headers={"User-Agent": "your-reminder/1.0 (HK weather auto-remind; +https://github.com/HugoWong528/your-reminder)"},
+                headers={"User-Agent": USER_AGENT},
             )
             with urllib.request.urlopen(req, timeout=self.timeout) as response:
                 raw_xml = response.read().decode("utf-8")
@@ -175,6 +217,82 @@ class WeatherFetcher:
         )
         if wind_dir_match:
             data.wind_direction = wind_dir_match.group(1)
+
+
+# ---------------------------------------------------------------------------
+# Location-aware weather fetcher
+# ---------------------------------------------------------------------------
+
+
+class HKOLocationWeatherFetcher:
+    """
+    Fetches weather data combining:
+    - Station-specific temperature from the HKO ``rhrread`` JSON API.
+    - General conditions (humidity, wind, description) from the HKO RSS feed.
+
+    Default station: 元朗公園 (nearest HKO station to Yuen Long Park).
+    """
+
+    def __init__(
+        self,
+        station: str = DEFAULT_LOCATION,
+        timeout: int = REQUEST_TIMEOUT,
+    ):
+        # Resolve user-friendly alias to the HKO station name.
+        self.station = AVAILABLE_LOCATIONS.get(station, station)
+        self.timeout = timeout
+        self._rss_fetcher = WeatherFetcher()
+
+    def fetch(self) -> WeatherData:
+        """Return a WeatherData object with station-specific temperature."""
+        # Start with general HK weather (description, humidity, wind).
+        try:
+            weather = self._rss_fetcher.fetch()
+        except RuntimeError as exc:
+            logger.warning("RSS fetch failed (%s); using rhrread only", exc)
+            weather = WeatherData()
+
+        # Override temperature (and possibly humidity) with rhrread data.
+        try:
+            rhrread = self._fetch_rhrread()
+
+            for item in rhrread.get("temperature", {}).get("data", []):
+                if item.get("place") == self.station:
+                    weather.temperature_c = float(item["value"])
+                    logger.info(
+                        "Station '%s' temperature: %.1f°C",
+                        self.station,
+                        weather.temperature_c,
+                    )
+                    break
+            else:
+                logger.warning(
+                    "Station '%s' not found in rhrread; keeping RSS temperature",
+                    self.station,
+                )
+
+            # Humidity is only available at 香港天文台 in rhrread.
+            if weather.humidity_pct is None:
+                for item in rhrread.get("humidity", {}).get("data", []):
+                    weather.humidity_pct = float(item["value"])
+                    break
+
+        except Exception as exc:
+            logger.warning("rhrread fetch failed (%s); using RSS data only", exc)
+
+        return weather
+
+    def _fetch_rhrread(self) -> dict:
+        """Fetch HKO real-time hourly readings JSON."""
+        url = f"{HKO_RHRREAD_URL}?dataType=rhrread&lang=tc"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": USER_AGENT
+            },
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +423,102 @@ class ClothingSuggester:
             # Limit description length for the prompt
             parts.append(f"天氣情況: {weather.description[:200]}")
         return "，".join(parts) if parts else "天氣資料未能獲取"
+
+    # ------------------------------------------------------------------
+    # Mode-aware suggestion (school / going-out)
+    # ------------------------------------------------------------------
+
+    def suggest_with_mode(self, weather: WeatherData, mode: str = "street") -> str:
+        """
+        Return a clothing suggestion for *mode* (``'school'`` or ``'street'``).
+
+        Always attempts an AI-powered suggestion first (pollinations.ai is free);
+        falls back to rule-based advice when the AI call fails.
+        """
+        try:
+            return self._ai_suggest_with_mode(weather, mode)
+        except Exception as exc:
+            logger.warning(
+                "AI suggestion failed for mode '%s' (%s); using rules", mode, exc
+            )
+        if mode == "school":
+            return self._rule_suggest_school(weather)
+        return self._rule_suggest(weather)
+
+    def _ai_suggest_with_mode(self, weather: WeatherData, mode: str) -> str:
+        """Call pollinations.ai with a prompt tailored to *mode*."""
+        weather_info = self._build_prompt(weather)
+
+        if mode == "school":
+            system_msg = (
+                "你係一個香港男生嘅返學穿搭助手。"
+                "根據天氣，從以下校服清單選出合適嘅搭配，"
+                "用廣東話回覆，語氣親切，150字以內。\n\n"
+                + SCHOOL_CLOTHING_LIST
+            )
+            user_msg = f"今日天氣：{weather_info}\n請建議返學著咩校服。"
+        else:
+            system_msg = (
+                "你係一個香港天氣助手，用戶係男生。"
+                "根據天氣資訊，用廣東話建議今日出街著咩衫，語氣親切簡潔，150字以內。"
+            )
+            user_msg = f"今日天氣：{weather_info}"
+
+        payload = {
+            "model": "openai",
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            "max_tokens": 300,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self.pollinations_api_key:
+            headers["Authorization"] = f"Bearer {self.pollinations_api_key}"
+        req = urllib.request.Request(
+            POLLINATIONS_API_URL,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        return result["choices"][0]["message"]["content"].strip()
+
+    def _rule_suggest_school(self, weather: WeatherData) -> str:
+        """Rule-based school-uniform suggestion for a male student."""
+        temp = weather.temperature_c
+        if temp is None:
+            return "⚠️ 無法獲取溫度，請自行決定著咩返學。"
+
+        items: list[str] = []
+
+        if temp < 10:
+            items = [
+                "長袖恤衫 + 長褲",
+                "毛衣(長袖)",
+                "校褸",
+                "保暖底衫 + 保暖底褲",
+            ]
+        elif temp < 15:
+            items = ["長袖恤衫 + 長褲", "毛衣(長袖)", "校褸", "長袖底衫"]
+        elif temp < 20:
+            items = ["長袖恤衫 + 長褲", "毛衣(背心) 或 毛衣(長袖)"]
+        elif temp < 25:
+            items = ["短袖恤衫 + 長褲", "可帶備毛衣(背心) 以防冷氣"]
+        else:
+            items = ["短袖恤衫 + 長褲"]
+
+        wind = weather.wind_speed_kmh
+        if wind is not None and wind >= 20 and "PE 外套(風褸)" not in " ".join(items):
+            items.append("帶備 PE 外套(風褸) 防風")
+
+        desc_lower = weather.description.lower()
+        if any(kw in desc_lower for kw in ["rain", "shower", "雨", "驟雨"]):
+            items.append("記得帶雨傘！")
+
+        return "\n".join(f"• {item}" for item in items)
 
 
 # ---------------------------------------------------------------------------
