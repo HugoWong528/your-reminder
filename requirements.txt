@@ -1,0 +1,2 @@
+# Runtime dependencies
+schedule>=1.2.0
