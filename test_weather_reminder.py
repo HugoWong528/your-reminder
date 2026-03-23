@@ -11,6 +11,10 @@ from weather_reminder import (
     WeatherFetcher,
     ClothingSuggester,
     WeatherReminder,
+    HKOLocationWeatherFetcher,
+    DEFAULT_LOCATION,
+    AVAILABLE_LOCATIONS,
+    SCHOOL_CLOTHING_LIST,
 )
 
 # ---------------------------------------------------------------------------
@@ -276,3 +280,200 @@ def json_response(content: str) -> bytes:
     return json.dumps(
         {"choices": [{"message": {"content": content, "role": "assistant"}}]}
     ).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# HKOLocationWeatherFetcher tests
+# ---------------------------------------------------------------------------
+
+SAMPLE_RHRREAD = {
+    "temperature": {
+        "data": [
+            {"place": "元朗公園", "value": 27, "unit": "C"},
+            {"place": "沙田", "value": 25, "unit": "C"},
+            {"place": "香港天文台", "value": 24, "unit": "C"},
+        ],
+        "recordTime": "2026-03-23T08:00:00+08:00",
+    },
+    "humidity": {
+        "data": [{"place": "香港天文台", "value": 82, "unit": "percent"}],
+        "recordTime": "2026-03-23T08:00:00+08:00",
+    },
+}
+
+
+class TestHKOLocationWeatherFetcher:
+    def _mock_rhrread(self, fetcher):
+        fetcher._fetch_rhrread = MagicMock(return_value=SAMPLE_RHRREAD)
+
+    def _mock_rss(self, fetcher):
+        fetcher._rss_fetcher = MagicMock()
+        fetcher._rss_fetcher.fetch.return_value = WeatherData(
+            temperature_c=22.0,
+            humidity_pct=85.0,
+            wind_speed_kmh=15.0,
+            wind_direction="東北",
+            description="間中有驟雨",
+        )
+
+    def test_default_location_is_yuenlong_park(self):
+        fetcher = HKOLocationWeatherFetcher()
+        assert fetcher.station == "元朗公園"
+
+    def test_alias_resolution(self):
+        assert HKOLocationWeatherFetcher(station="元朗").station == "元朗公園"
+        assert HKOLocationWeatherFetcher(station="荃灣").station == "荃灣城門谷"
+        assert HKOLocationWeatherFetcher(station="中環").station == "香港天文台"
+
+    def test_station_temperature_overrides_rss(self):
+        fetcher = HKOLocationWeatherFetcher(station="元朗公園")
+        self._mock_rss(fetcher)
+        self._mock_rhrread(fetcher)
+        weather = fetcher.fetch()
+        # rhrread says 27°C for 元朗公園; RSS said 22°C → should be 27°C
+        assert weather.temperature_c == 27.0
+
+    def test_missing_station_keeps_rss_temperature(self):
+        fetcher = HKOLocationWeatherFetcher(station="塔門")
+        self._mock_rss(fetcher)
+        fetcher._fetch_rhrread = MagicMock(return_value=SAMPLE_RHRREAD)
+        weather = fetcher.fetch()
+        # 塔門 is not in the mock rhrread, so RSS temperature (22°C) is kept
+        assert weather.temperature_c == 22.0
+
+    def test_humidity_filled_from_rhrread_when_rss_absent(self):
+        fetcher = HKOLocationWeatherFetcher(station="元朗公園")
+        # RSS returns no humidity
+        fetcher._rss_fetcher = MagicMock()
+        fetcher._rss_fetcher.fetch.return_value = WeatherData(temperature_c=22.0)
+        self._mock_rhrread(fetcher)
+        weather = fetcher.fetch()
+        assert weather.humidity_pct == 82.0
+
+    def test_rhrread_failure_falls_back_to_rss(self):
+        fetcher = HKOLocationWeatherFetcher(station="元朗公園")
+        self._mock_rss(fetcher)
+        fetcher._fetch_rhrread = MagicMock(side_effect=RuntimeError("network error"))
+        weather = fetcher.fetch()
+        # RSS temperature kept when rhrread fails
+        assert weather.temperature_c == 22.0
+
+    def test_available_locations_constant(self):
+        assert "元朗公園" in AVAILABLE_LOCATIONS
+        assert "元朗" in AVAILABLE_LOCATIONS
+        assert DEFAULT_LOCATION == "元朗公園"
+
+
+# ---------------------------------------------------------------------------
+# ClothingSuggester – school / street mode tests
+# ---------------------------------------------------------------------------
+
+
+class TestClothingSuggesterModes:
+    def _make_weather(self, temp=None, humid=None, wind=None, desc=""):
+        return WeatherData(
+            temperature_c=temp,
+            humidity_pct=humid,
+            wind_speed_kmh=wind,
+            description=desc,
+        )
+
+    # --- Rule-based school suggestions ---
+
+    def test_school_very_cold_includes_校褸(self):
+        s = ClothingSuggester()
+        tip = s._rule_suggest_school(self._make_weather(temp=8))
+        assert "校褸" in tip
+
+    def test_school_cold_includes_long_sleeve(self):
+        s = ClothingSuggester()
+        tip = s._rule_suggest_school(self._make_weather(temp=13))
+        assert "長袖恤衫" in tip
+
+    def test_school_cool_includes_vest_or_long_sweater(self):
+        s = ClothingSuggester()
+        tip = s._rule_suggest_school(self._make_weather(temp=18))
+        assert "毛衣" in tip
+
+    def test_school_comfortable_short_sleeve(self):
+        s = ClothingSuggester()
+        tip = s._rule_suggest_school(self._make_weather(temp=22))
+        assert "短袖恤衫" in tip
+
+    def test_school_hot_short_sleeve(self):
+        s = ClothingSuggester()
+        tip = s._rule_suggest_school(self._make_weather(temp=30))
+        assert "短袖恤衫" in tip
+
+    def test_school_windy_includes_pe_jacket(self):
+        s = ClothingSuggester()
+        tip = s._rule_suggest_school(self._make_weather(temp=22, wind=30))
+        assert "PE 外套" in tip or "風褸" in tip
+
+    def test_school_rainy_includes_umbrella(self):
+        s = ClothingSuggester()
+        tip = s._rule_suggest_school(self._make_weather(temp=22, desc="有驟雨"))
+        assert "雨傘" in tip
+
+    def test_school_no_temperature_warning(self):
+        s = ClothingSuggester()
+        tip = s._rule_suggest_school(self._make_weather(temp=None))
+        assert "⚠️" in tip
+
+    # --- suggest_with_mode falls back to rules when AI fails ---
+
+    def test_suggest_with_mode_school_fallback(self):
+        import urllib.error
+
+        s = ClothingSuggester(pollinations_api_key="fake")
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError("network error"),
+        ):
+            tip = s.suggest_with_mode(self._make_weather(temp=22), mode="school")
+        assert len(tip) > 0  # rule-based fallback produced output
+
+    def test_suggest_with_mode_street_fallback(self):
+        import urllib.error
+
+        s = ClothingSuggester(pollinations_api_key="fake")
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError("network error"),
+        ):
+            tip = s.suggest_with_mode(self._make_weather(temp=22), mode="street")
+        assert len(tip) > 0
+
+    def test_suggest_with_mode_school_ai_success(self):
+        """AI is called and its response is returned for school mode."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json_response("建議穿長袖恤衫加校褸。")
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        s = ClothingSuggester(pollinations_api_key="sk_test")
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            tip = s.suggest_with_mode(
+                self._make_weather(temp=15, humid=70), mode="school"
+            )
+        assert "長袖恤衫" in tip or "校褸" in tip
+
+    def test_suggest_with_mode_street_ai_success(self):
+        """AI is called and its response is returned for street mode."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json_response("今日涼快，著件薄外套出街啦。")
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        s = ClothingSuggester()
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            tip = s.suggest_with_mode(
+                self._make_weather(temp=18, humid=75), mode="street"
+            )
+        assert "外套" in tip
+
+    def test_school_clothing_list_constant_exists(self):
+        assert "恤衫" in SCHOOL_CLOTHING_LIST
+        assert "校褸" in SCHOOL_CLOTHING_LIST
+        assert "PE 外套" in SCHOOL_CLOTHING_LIST
+
